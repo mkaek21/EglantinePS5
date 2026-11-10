@@ -1,0 +1,113 @@
+Consolidation candidate on heydemoura/EglantinePS5 28d3d90.
+Sources: viejunerd/Eglantine-PS5- 6243701 (patches 0072, 0077, 0080, 0081).
+Original authors and licenses retained. The last three are Lichii fixes
+carried by viejunerd commit 01bdcbb; texture staging is from 6273324.
+
+Bounds layered uploads, counts nested returns before shader demotes,
+serializes dirty-memory gathering and prevents lost worker cancellation wakes.
+
+Partial integration only: NUP/DLC loader, v1.219.029 storage-size guard,
+ReserveOver allocator changes and PS5_Lichii/Fritchii-specific features
+still need porting and validation. This patch is not a full fork merger.
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index dcfd270df3..a4d6165390 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2009,6 +2009,28 @@ std::vector<u32> TextureCache<P>::BindSparseLayers(Image& image, std::span<const
+ template <class P>
+ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
+     if constexpr (requires { &Runtime::AccelerateImageUploadLayers; }) {
++        // One staging buffer for every layer took 352 MiB for four of title 1's terrain layers
++        // (85 MiB each) and was refused with the shared pool full, mid-race. Past 128 MiB the
++        // layers go in groups; the GPU finishes each group before the next, so the next one gets
++        // the same staging buffer back instead of another one.
++        constexpr size_t MaxStagingBytes = 128_MiB;
++        ImageInfo one_layer = image.info;
++        one_layer.resources.layers = 1;
++        const size_t layer_bytes =
++            False(image.flags & ImageFlagBits::AcceleratedUpload)
++                ? CalculateUnswizzledSizeBytes(one_layer)
++                : image.info.layer_stride -
++                      FullUploadSwizzles(image.info)[image.host_level_offset].buffer_offset;
++        const size_t per_group = (std::max<size_t>)(1, MaxStagingBytes / (std::max<size_t>)(layer_bytes, 1));
++        if (layers.size() > per_group) {
++            for (size_t first = 0; first < layers.size(); first += per_group) {
++                if (first != 0) {
++                    runtime.Finish();
++                }
++                UploadLayers(image, layers.subspan(first, (std::min)(per_group, layers.size() - first)));
++            }
++            return;
++        }
+         if (False(image.flags & ImageFlagBits::AcceleratedUpload)) {
+             // Plain formats: each layer unswizzled on its own into its layer of the image.
+             ImageInfo layer_info = image.info;
+
+diff --git a/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp b/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+index 50cff52f88..7a31d035d1 100644
+--- a/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
++++ b/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+@@ -904,16 +904,18 @@ private:
+             if (node.type != Type::Block) {
+                 continue;
+             }
+-            if (branch_depth > 1) {
+-                // Skip reordering nested demote branches.
+-                continue;
+-            }
+             for (const IR::Inst& inst : node.data.block->Instructions()) {
+                 const IR::Opcode op{inst.GetOpcode()};
+                 if (op == IR::Opcode::DemoteToHelperInvocation) {
+-                    demote_blocks.push_back(node.data.block);
++                    // Skip reordering nested demote branches.
++                    if (branch_depth <= 1) {
++                        demote_blocks.push_back(node.data.block);
++                    }
+                     break;
+                 }
++                // Returns count at any depth: a nested early return (an EXIT under two
++                // conditions, as native fragment programs end their discarded invocations) would
++                // otherwise leave before the demote moved to the end, and write its colours.
+                 if (op == IR::Opcode::Epilogue) {
+                     ++num_epilogues;
+                 }
+
+diff --git a/src/core/gpu_dirty_memory_manager.h b/src/core/gpu_dirty_memory_manager.h
+index 8a895114e7..e6bf2d46b4 100644
+--- a/src/core/gpu_dirty_memory_manager.h
++++ b/src/core/gpu_dirty_memory_manager.h
+@@ -64,6 +64,9 @@ public:
+     }
+ 
+     void Gather(std::function<void(PAddr, size_t)>& callback) {
++        // FlushRegion also gathers off the GPU thread (host1x video decode reads); serialize
++        // gatherers so one cannot swap or clear front_buffer while another iterates it.
++        std::scoped_lock gather_lk(gather_guard);
+         {
+             std::scoped_lock lk(guard);
+             TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
+@@ -135,6 +138,7 @@ private:
+ 
+     std::atomic<TransformAddress> current{};
+     std::mutex guard;
++    std::mutex gather_guard;
+     std::vector<TransformAddress> back_buffer;
+     std::vector<TransformAddress> front_buffer;
+ };
+
+diff --git a/src/common/thread_worker.h b/src/common/thread_worker.h
+index ec3ca0af49..f0cdf96b8d 100644
+--- a/src/common/thread_worker.h
++++ b/src/common/thread_worker.h
+@@ -81,7 +81,10 @@ public:
+                     ++work_done;
+                 }
+             }
+-            ++workers_stopped;
++            {
++                std::scoped_lock lock{queue_mutex};
++                ++workers_stopped;
++            }
+             wait_condition.notify_all();
+         };
+         threads.reserve(num_workers);
