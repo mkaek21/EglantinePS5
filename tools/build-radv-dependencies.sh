@@ -40,6 +40,21 @@ for lang, compiler in [('c', 'prospero-clang'), ('cpp', 'prospero-clang++')]:
 p.write_text(s)
 PY
 bash "$vulkan/tools/setup-native-dependencies.sh"
+# CI caches the installed driver, but not its exported Mesa sources. If a
+# changed adaptation requires rebuilding, upstream must recreate that export
+# instead of accepting the cached installation's provenance and returning early.
+python3 - "$vulkan" "$(pin ps5-mesa)" <<'PY'
+from pathlib import Path
+import sys
+vulkan = Path(sys.argv[1])
+source = vulkan / '.deps/work/radv-src'
+revision = source / '.revision'
+receipt = vulkan / '.deps/native/radv-release/PROVENANCE.txt'
+if not revision.is_file() or revision.read_text().strip() != sys.argv[2]:
+    if receipt.is_file():
+        receipt.replace(receipt.with_suffix('.base.txt'))
+        print('RADV: rebuilding cached driver to restore its pinned source export')
+PY
 bash "$vulkan/tools/build-radv.sh" release
 python3 "$root/tools/patch-radv-wsi.py"
 python3 "$root/tools/patch-radv-disk-cache.py"
