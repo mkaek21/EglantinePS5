@@ -1,0 +1,123 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <algorithm>
+#include <cstdlib>
+#include <stdexcept>
+#include <variant>
+#include <boost/container/static_vector.hpp>
+
+#include "common/assert.h"
+#include "common/logging.h"
+#include "video_core/renderer_vulkan/descriptor_payload_growth.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/vulkan_common/vulkan_wrapper.h"
+
+namespace Vulkan {
+
+namespace {
+// Each queue's host storage starts at 1/n of its size and grows on demand up to the usual ceiling,
+// four times the size. EDEN_DESCRIPTOR_START_DIV=<n> sets n (1 = the full size at start).
+// PS5: n = 4 by default, so the guest queue starts at 0x20000 entries (24 MiB instead of 96) and
+// the compute queues at 0x8000 (6 MiB instead of 24). Peaks seen a frame: guest 48k (MKW) and
+// 76-80k (Zelda), compute 5-14k, so neither grows (docs/HEAP-MEMORY-RESEARCH.md).
+size_t StartPayloadSize(size_t size) {
+    static const size_t divisor = [] {
+#if defined(__PROSPERO__) // PS5
+        constexpr long default_divisor = 4;
+#else
+        constexpr long default_divisor = 1;
+#endif
+        const char* value = std::getenv("EDEN_DESCRIPTOR_START_DIV");
+        const long parsed = value ? std::strtol(value, nullptr, 10) : default_divisor;
+        return static_cast<size_t>(parsed >= 1 && parsed <= 64 ? parsed : default_divisor);
+    }();
+    return (std::max<size_t>)(size / divisor, 0x1000);
+}
+} // Anonymous namespace
+
+UpdateDescriptorQueue::UpdateDescriptorQueue(const Device& device_, size_t frame_payload_size_,
+                                             bool supports_descriptor_buffer_)
+    : device{device_}, frame_payload_size{StartPayloadSize(frame_payload_size_)},
+      maximum_frame_payload_size{frame_payload_size_ * 4},
+      supports_descriptor_buffer{supports_descriptor_buffer_},
+      payload(std::make_unique_for_overwrite<DescriptorUpdateEntry[]>(StartPayloadSize(frame_payload_size_) * FRAMES_IN_FLIGHT))
+{
+    payload_start = payload.get();
+    payload_cursor = payload.get();
+}
+
+UpdateDescriptorQueue::~UpdateDescriptorQueue() = default;
+
+void UpdateDescriptorQueue::TickFrame() {
+    // Research: the most entries one frame used, every 3,600 frames.
+    peak_frame_entries = (std::max)(peak_frame_entries,
+                                    static_cast<size_t>(std::distance(payload_start, payload_cursor)));
+    if (++ticks_since_report >= 3600) {
+        LOG_INFO(Render_Vulkan, "Descriptor queue: peak {} entries a frame of {} ({} MiB host storage)",
+                 peak_frame_entries, frame_payload_size,
+                 frame_payload_size * FRAMES_IN_FLIGHT * sizeof(DescriptorUpdateEntry) >> 20);
+        ticks_since_report = 0;
+        peak_frame_entries = 0;
+    }
+    if (++frame_index >= FRAMES_IN_FLIGHT) {
+        frame_index = 0;
+    }
+    payload_start = payload.get() + frame_index * frame_payload_size;
+    payload_cursor = payload_start;
+}
+
+/// Reserve one batch, growing drained host storage when possible, otherwise reusing it safely.
+void UpdateDescriptorQueue::Acquire(Scheduler& scheduler, size_t required_entries,
+                                    bool use_descriptor_buffer_) {
+    use_descriptor_buffer = supports_descriptor_buffer && use_descriptor_buffer_;
+    static constexpr size_t DEFAULT_REQUIRED_ENTRIES = 0x400;
+    const size_t reserve = required_entries > 0 ? required_entries : DEFAULT_REQUIRED_ENTRIES;
+    if (reserve > maximum_frame_payload_size) {
+        throw std::length_error("Descriptor reservation exceeds the bounded staging capacity");
+    }
+    const size_t used = static_cast<size_t>(std::distance(payload_start, payload_cursor));
+    if (reserve > frame_payload_size || used > frame_payload_size - reserve) {
+        const size_t old_capacity = frame_payload_size;
+        peak_frame_entries = (std::max)(peak_frame_entries, used + reserve);
+        auto result = PayloadGrowthResult::AtLimit;
+        if (!growth_disabled) {
+            result = GrowDescriptorPayload(
+                payload, frame_payload_size, maximum_frame_payload_size, FRAMES_IN_FLIGHT,
+                (std::min)(used + reserve, maximum_frame_payload_size),
+                [&] { scheduler.WaitWorker(); },
+                [](size_t count) {
+                    return std::make_unique_for_overwrite<DescriptorUpdateEntry[]>(count);
+                });
+        }
+        if (result == PayloadGrowthResult::Grown) {
+            LOG_INFO(Render_Vulkan,
+                     "Descriptor payload grew: {} -> {} entries/frame, host storage {} MiB, used={}, reserve={}",
+                     old_capacity, frame_payload_size,
+                     frame_payload_size * FRAMES_IN_FLIGHT * sizeof(DescriptorUpdateEntry) / 1048576,
+                     used, reserve);
+        } else {
+            growth_disabled |= result == PayloadGrowthResult::AllocationFailed;
+            if (reserve > frame_payload_size) {
+                throw std::bad_alloc{};
+            }
+            if (!fallback_reported) {
+                LOG_WARNING(Render_Vulkan,
+                            "Descriptor payload growth {} at {} entries/frame; using worker drain fallback",
+                            growth_disabled ? "allocation failed" : "limit reached", frame_payload_size);
+                fallback_reported = true;
+            }
+            scheduler.WaitWorker();
+        }
+        payload_start = payload.get() + frame_index * frame_payload_size;
+        payload_cursor = payload_start;
+    }
+    upload_start = payload_cursor;
+}
+
+} // namespace Vulkan
